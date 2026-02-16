@@ -44,9 +44,11 @@ git clone git@github.com:dndodson/render-deploy-boilerplate.git /tmp/boilerplate
   --stack python  # or node
 ```
 
-## One-Time Setup: Render API Key
+## One-Time Setup
 
 You only need to do this once, not per project.
+
+### 1. Render API Key
 
 1. Go to [Render Dashboard](https://dashboard.render.com/) > Account Settings > API Keys
 2. Click "Create API Key" and copy the key (`rnd_...`)
@@ -55,7 +57,17 @@ You only need to do this once, not per project.
    RENDER_API_KEY=rnd_xxxxx
    ```
 
-If you're using `agentic-dev.sh deploy provision`, this key is read from the environment automatically. It's also used to set the GitHub repo secret so the Actions workflow can trigger deploys.
+### 2. GitHub Organization Secret
+
+`RENDER_API_KEY` is set as an **organization-level secret** on the `climatecentral-ai` GitHub org. This makes it available to all repos in the org without setting it per-repo.
+
+```bash
+gh secret set RENDER_API_KEY --org climatecentral-ai --visibility all --body "$RENDER_API_KEY"
+```
+
+Only `RENDER_SERVICE_ID` needs to be set per-repo (automated by `deploy provision`).
+
+Repos must live under the `climatecentral-ai` org for the org secret to work. Using `--with-deploy` on `repo create` defaults to this org automatically.
 
 ## How It Works
 
@@ -74,8 +86,8 @@ Render builds Dockerfile and deploys
 
 1. **On push to `main`**, the GitHub Actions workflow fires
 2. It calls the Render API to trigger a deploy using two secrets:
-   - `RENDER_SERVICE_ID` — identifies which Render service to deploy
-   - `RENDER_API_KEY` — authenticates the API request
+   - `RENDER_API_KEY` — org-level secret on `climatecentral-ai`, authenticates the API request
+   - `RENDER_SERVICE_ID` — per-repo secret, identifies which Render service to deploy
 3. Render pulls the latest code, builds the Docker image, and deploys it
 
 ## Customizing
