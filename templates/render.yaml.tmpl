@@ -1,0 +1,12 @@
+services:
+  - type: web
+    runtime: docker
+    name: __SERVICE_NAME__
+    plan: starter
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "__PORT__"
+      - key: NODE_ENV
+        value: production

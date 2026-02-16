@@ -1,0 +1,49 @@
+---
+description: Agent coding conventions for commits, PRs, and code quality
+globs:
+alwaysApply: true
+---
+
+# Agent Coding Conventions
+
+## Git Commits
+
+Use conventional commits for all changes:
+
+- `feat(<scope>): <description>` -- new functionality
+- `fix(<scope>): <description>` -- bug fixes
+- `refactor(<scope>): <description>` -- code restructuring without behavior change
+- `docs(<scope>): <description>` -- documentation only
+- `test(<scope>): <description>` -- adding or updating tests
+- `chore(<scope>): <description>` -- build, deps, config changes
+
+Scope is optional but preferred (e.g., `feat(auth): add JWT token validation`).
+
+Each commit must be:
+- **Atomic**: one logical change per commit
+- **Buildable**: the project compiles/runs after this commit
+- **Tested**: relevant tests pass after this commit
+
+Commit messages explain *why*, not just *what*. The diff shows what changed; the message explains the reasoning.
+
+## Pull Requests
+
+- One logical change per PR
+- Keep PRs small and reviewable (under 15 minutes to review)
+- PR title matches the primary commit type (e.g., `feat(auth): add JWT authentication`)
+- PR body includes: summary of changes, motivation, and test plan
+
+## Code Quality
+
+- Run the project's test suite before committing
+- Run the project's linter/formatter before committing
+- Do not commit secrets, credentials, API keys, or tokens
+- Do not commit generated files, build artifacts, or dependency directories
+- Follow existing code style and patterns in the project
+
+## Task Completion
+
+When a task is complete:
+1. Ensure all changes are committed with proper conventional commit messages
+2. Verify tests pass
+3. Summarize what was changed and what to test manually (if applicable)
