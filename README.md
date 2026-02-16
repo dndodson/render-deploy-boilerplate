@@ -1,6 +1,6 @@
 # render-deploy-boilerplate
 
-Production-grade deployment boilerplate for [Render](https://render.com). Provides Dockerfile templates, a `render.yaml` Blueprint, and a GitHub Actions workflow that triggers deploys on push to `main`.
+Production-grade deployment boilerplate for [Render](https://render.com). CI builds and pushes Docker images to GitHub Container Registry (ghcr.io), then Render pulls the prebuilt image -- no double builds, no Render GitHub App needed.
 
 ## What's Included
 
@@ -8,117 +8,104 @@ Production-grade deployment boilerplate for [Render](https://render.com). Provid
 |------|---------|
 | `templates/Dockerfile.python` | Multi-stage Python image (gunicorn, non-root user, health check) |
 | `templates/Dockerfile.node` | Multi-stage Node.js image (npm ci, non-root user, health check) |
-| `templates/render.yaml.tmpl` | Render Blueprint with `__SERVICE_NAME__` and `__PORT__` placeholders |
-| `templates/.github/workflows/render-deploy.yml` | GitHub Actions workflow — triggers Render deploy via API |
+| `templates/render.yaml.tmpl` | Render Blueprint for image-backed service |
+| `templates/.github/workflows/render-deploy.yml` | CI + deploy: build, test, push to ghcr.io, trigger Render |
 | `templates/.dockerignore` | Standard ignore patterns for Docker builds |
 | `templates/.env.example` | Template environment variables |
 | `scaffold.sh` | Copies and customizes templates into a target project |
+
+## How It Works
+
+```
+Push to main
+    |
+    v
+GitHub Actions
+    |-- checkout code
+    |-- build Docker image (linux/amd64)
+    |-- run tests against the image
+    |-- push image to ghcr.io/<org>/<repo>:<sha>
+    |-- trigger Render deploy with image ref
+    |
+    v
+Render
+    |-- pull prebuilt image from ghcr.io
+    |-- start container
+    |-- health check /health
+    |-- route traffic
+```
+
+The image is built exactly **once** in GitHub Actions. Render never clones your repo or builds anything -- it only pulls and runs the prebuilt image. This means:
+
+- No Render GitHub App installation needed (even for private repos)
+- CI tests run against the exact image that gets deployed
+- Build only happens once
+- Full control over the build pipeline in GitHub Actions
 
 ## Quick Start
 
 ### Option A: Via agentic-dev.sh (recommended)
 
-If you're using the OpenClaw agentic-dev workflow, deploy scaffolding is built in:
-
 ```bash
-# Scaffold deploy files into an existing repo
-agentic-dev.sh deploy scaffold <repo> --stack python
-
-# Provision the Render service and set GitHub secrets automatically
-agentic-dev.sh deploy provision <repo>
-
-# Or do everything at once when creating a new project
+# Create a new project with full deploy infrastructure
 agentic-dev.sh repo create my-app --description "My app" --with-deploy --stack python
+
+# Or scaffold into an existing repo
+agentic-dev.sh deploy scaffold my-app --stack python
+agentic-dev.sh deploy provision my-app
 ```
 
 ### Option B: Standalone
 
 ```bash
-# Clone this repo
 git clone git@github.com:dndodson/render-deploy-boilerplate.git /tmp/boilerplate
 
-# Scaffold into your project
 /tmp/boilerplate/scaffold.sh \
   --target /path/to/your/project \
   --name your-service-name \
-  --stack python  # or node
+  --gh-repo climatecentral-ai/your-repo \
+  --stack python
 ```
 
 ## One-Time Setup
 
-You only need to do this once, not per project.
-
 ### 1. Render API Key
 
 1. Go to [Render Dashboard](https://dashboard.render.com/) > Account Settings > API Keys
-2. Click "Create API Key" and copy the key (`rnd_...`)
-3. Add it to your OpenClaw `.env` file:
+2. Create a key and add to `$OPENCLAW/.env`:
    ```
    RENDER_API_KEY=rnd_xxxxx
    ```
 
 ### 2. GitHub Organization Secret
 
-`RENDER_API_KEY` is set as an **organization-level secret** on the `climatecentral-ai` GitHub org. This makes it available to all repos in the org without setting it per-repo.
+Set `RENDER_API_KEY` as an org secret on `climatecentral-ai`:
 
 ```bash
 gh secret set RENDER_API_KEY --org climatecentral-ai --visibility all --body "$RENDER_API_KEY"
 ```
 
-Only `RENDER_SERVICE_ID` needs to be set per-repo (automated by `deploy provision`).
+### 3. GHCR Registry Credential in Render
 
-Repos must live under the `climatecentral-ai` org for the org secret to work. Using `--with-deploy` on `repo create` defaults to this org automatically.
+Render needs credentials to pull private images from ghcr.io:
 
-## How It Works
+1. Create a GitHub Personal Access Token with `read:packages` scope at [github.com/settings/tokens/new](https://github.com/settings/tokens/new?description=render-ghcr&scopes=read:packages)
+2. In Render Dashboard > Workspace Settings > Container Registry Credentials, click "Add credential":
+   - **Name**: `ghcr-climatecentral-ai`
+   - **Registry**: GitHub Container Registry
+   - **Username**: your GitHub username
+   - **Personal Access Token**: the token from step 1
 
-```
-Push to main
-    │
-    ▼
-GitHub Actions (.github/workflows/render-deploy.yml)
-    │
-    ▼
-POST https://api.render.com/v1/services/{SERVICE_ID}/deploys
-    │
-    ▼
-Render builds Dockerfile and deploys
-```
+This credential is reused across all services.
 
-1. **On push to `main`**, the GitHub Actions workflow fires
-2. It calls the Render API to trigger a deploy using two secrets:
-   - `RENDER_API_KEY` — org-level secret on `climatecentral-ai`, authenticates the API request
-   - `RENDER_SERVICE_ID` — per-repo secret, identifies which Render service to deploy
-3. Render pulls the latest code, builds the Docker image, and deploys it
+## Secrets Architecture
 
-## Customizing
-
-### Dockerfile
-
-The scaffolded `Dockerfile` is a starting point. Common customizations:
-
-- **Python**: Change `gunicorn` to `uvicorn` for async apps, adjust worker count
-- **Node**: Change `src/index.js` entry point, add build steps for TypeScript
-- **Both**: Add system dependencies in the builder stage, adjust health check paths
-
-### render.yaml
-
-The `render.yaml` file is a Render Blueprint. After scaffolding, you can:
-
-- Change the `plan` (free, starter, standard, pro)
-- Change the `region` (oregon, ohio, virginia, frankfurt, singapore)
-- Add environment variables
-- Add persistent disks
-- Add additional services (workers, cron jobs, databases)
-
-See the [Render Blueprint docs](https://render.com/docs/blueprint-spec) for the full specification.
-
-### GitHub Actions Workflow
-
-The workflow is minimal by design. You can extend it with:
-
-- Build/test steps before the deploy trigger
-- Deployment status notifications (Slack, email)
-- Environment-specific deploys (staging vs production)
+| Secret | Scope | Set by |
+|--------|-------|--------|
+| `RENDER_API_KEY` | GitHub org secret (`climatecentral-ai`) | One-time: `gh secret set --org` |
+| `RENDER_SERVICE_ID` | Per-repo GitHub secret | Automated by `deploy provision` |
+| `GITHUB_TOKEN` | Automatic (GitHub Actions) | GitHub provides this automatically |
+| `ghcr-climatecentral-ai` | Render registry credential | One-time: Render Dashboard |
 
 ## Health Check Endpoint
 
@@ -138,4 +125,21 @@ app.get('/health', (req, res) => {
 });
 ```
 
-Render also uses `healthCheckPath` in `render.yaml` for zero-downtime deploys.
+## Customizing
+
+### Dockerfile
+
+- **Python**: Change `gunicorn` to `uvicorn` for async apps, adjust worker count
+- **Node**: Change `src/index.js` entry point, add TypeScript build steps
+- **Both**: Add system deps in builder stage, adjust health check path
+
+### render.yaml
+
+Change plan, region, add env vars, databases, workers. See [Render Blueprint docs](https://render.com/docs/blueprint-spec).
+
+### CI Workflow
+
+- Add more test steps in the `build` job
+- Set `TEST_CMD` env var to customize what runs in the test step
+- Add notifications (Slack, email) to the `deploy` job
+- Add environment-specific deploys (staging vs production)
