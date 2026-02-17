@@ -58,17 +58,138 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Render Deploy
+      - uses: actions/checkout@v4
+
+      - name: Resolve Render service ID and trigger deploy
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
-          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
         run: |
-          if [ -z "$RENDER_SERVICE_ID" ] || [ -z "$RENDER_API_KEY" ]; then
-            echo "::warning::RENDER_SERVICE_ID or RENDER_API_KEY not set. Skipping deploy."
-            exit 0
-          fi
+          set -e
 
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+
+          # --- 1. Require API key (only secret needed) ---
+          if [ -z "$RENDER_API_KEY" ]; then
+            echo "::error::RENDER_API_KEY secret is not set. Add it in GitHub: Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+          # --- 2. Read service name (and optional plan/region) from render.yaml ---
+          if [ ! -f "render.yaml" ]; then
+            echo "::error::render.yaml not found in repo root. Cannot resolve Render service."
+            exit 1
+          fi
+          service_block=$(sed -n '/^services:/,/^[^ ]/p' render.yaml)
+          SERVICE_NAME=$(echo "$service_block" | grep -E '^\s+name:' | head -1 | sed 's/.*name:[[:space:]]*//' | tr -d ' "')
+          if [ -z "$SERVICE_NAME" ]; then
+            echo "::error::Could not read service name from render.yaml (expected 'name: <value>' under services)."
+            exit 1
+          fi
+          PLAN=$(echo "$service_block" | grep -E '^\s+plan:' | head -1 | sed 's/.*plan:[[:space:]]*//' | tr -d ' "')
+          REGION=$(echo "$service_block" | grep -E '^\s+region:' | head -1 | sed 's/.*region:[[:space:]]*//' | tr -d ' "')
+          PLAN=${PLAN:-starter}
+          REGION=${REGION:-oregon}
+          REGISTRY_CRED_NAME="ghcr-climatecentral-ai"
+          echo "Service name from render.yaml: $SERVICE_NAME (plan=$PLAN, region=$REGION)"
+
+          # --- 3. Resolve service ID via Render API (list by name) ---
+          echo "Fetching Render services to find ID for name \"$SERVICE_NAME\"..."
+          services_json=$(curl -s -w "\n%{http_code}" \
+            "https://api.render.com/v1/services?limit=100" \
+            -H "Accept: application/json" \
+            -H "Authorization: Bearer ${RENDER_API_KEY}")
+          list_http=$(echo "$services_json" | tail -1)
+          services_body=$(echo "$services_json" | head -n -1)
+
+          if [ "$list_http" != "200" ]; then
+            echo "::error::Render API list services failed with HTTP $list_http. Check RENDER_API_KEY is valid."
+            echo "$services_body" | jq . 2>/dev/null || echo "$services_body"
+            exit 1
+          fi
+
+          RENDER_SERVICE_ID=$(echo "$services_body" | jq -r --arg n "$SERVICE_NAME" '.[] | select(.name == $n) | .id' | head -1)
+          if [ -z "$RENDER_SERVICE_ID" ] || [ "$RENDER_SERVICE_ID" = "null" ]; then
+            # --- 3b. Create service if it does not exist ---
+            echo "No Render service found with name \"$SERVICE_NAME\". Creating service via API..."
+
+            owners_json=$(curl -s -w "\n%{http_code}" \
+              "https://api.render.com/v1/owners?limit=1" \
+              -H "Accept: application/json" \
+              -H "Authorization: Bearer ${RENDER_API_KEY}")
+            owners_http=$(echo "$owners_json" | tail -1)
+            owners_body=$(echo "$owners_json" | head -n -1)
+            if [ "$owners_http" != "200" ]; then
+              echo "::error::Render API list owners failed with HTTP $owners_http. Cannot create service."
+              exit 1
+            fi
+            OWNER_ID=$(echo "$owners_body" | jq -r '.[0].owner.id // empty')
+            if [ -z "$OWNER_ID" ]; then
+              echo "::error::Could not get Render owner ID. Check RENDER_API_KEY and workspace access."
+              exit 1
+            fi
+
+            creds_json=$(curl -s -w "\n%{http_code}" \
+              "https://api.render.com/v1/registryCredentials" \
+              -H "Accept: application/json" \
+              -H "Authorization: Bearer ${RENDER_API_KEY}")
+            creds_http=$(echo "$creds_json" | tail -1)
+            creds_body=$(echo "$creds_json" | head -n -1)
+            if [ "$creds_http" != "200" ]; then
+              echo "::error::Render API list registry credentials failed with HTTP $creds_http. Cannot create service."
+              exit 1
+            fi
+            REGISTRY_CRED_ID=$(echo "$creds_body" | jq -r --arg n "$REGISTRY_CRED_NAME" '.[] | select(.name == $n) | .id' | head -1)
+            if [ -z "$REGISTRY_CRED_ID" ]; then
+              echo "::error::Registry credential \"$REGISTRY_CRED_NAME\" not found in Render. Create it in Dashboard > Workspace Settings > Container Registry Credentials."
+              exit 1
+            fi
+
+            create_payload=$(jq -n \
+              --arg name "$SERVICE_NAME" \
+              --arg ownerId "$OWNER_ID" \
+              --arg imageUrl "$IMAGE_REF" \
+              --arg registryCredentialId "$REGISTRY_CRED_ID" \
+              --arg plan "$PLAN" \
+              --arg region "$REGION" \
+              '{
+                type: "web_service",
+                name: $name,
+                ownerId: $ownerId,
+                image: {
+                  ownerId: $ownerId,
+                  registryCredentialId: $registryCredentialId,
+                  imagePath: $imageUrl
+                },
+                plan: $plan,
+                region: $region,
+                serviceDetails: { env: "image" }
+              }')
+
+            create_response=$(curl -s -w "\n%{http_code}" -X POST \
+              "https://api.render.com/v1/services" \
+              -H "Authorization: Bearer ${RENDER_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$create_payload")
+            create_http=$(echo "$create_response" | tail -1)
+            create_body=$(echo "$create_response" | head -n -1)
+
+            if [ "$create_http" -ge 400 ]; then
+              echo "::error::Render API create service failed with HTTP $create_http"
+              echo "$create_body" | jq . 2>/dev/null || echo "$create_body"
+              exit 1
+            fi
+            RENDER_SERVICE_ID=$(echo "$create_body" | jq -r '.service.id // .id // empty')
+            if [ -z "$RENDER_SERVICE_ID" ]; then
+              echo "::error::Could not extract service ID from Render create response."
+              echo "$create_body" | jq . 2>/dev/null || echo "$create_body"
+              exit 1
+            fi
+            echo "Created Render service: $RENDER_SERVICE_ID"
+          else
+            echo "Resolved Render service ID: $RENDER_SERVICE_ID"
+          fi
+
+          # --- 4. Trigger deploy ---
           echo "Deploying image: $IMAGE_REF"
 
           response=$(curl -s -w "\n%{http_code}" -X POST \

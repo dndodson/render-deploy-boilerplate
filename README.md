@@ -103,9 +103,10 @@ This credential is reused across all services.
 | Secret | Scope | Set by |
 |--------|-------|--------|
 | `RENDER_API_KEY` | GitHub org secret (`climatecentral-ai`) | One-time: `gh secret set --org` |
-| `RENDER_SERVICE_ID` | Per-repo GitHub secret | Automated by `deploy provision` |
 | `GITHUB_TOKEN` | Automatic (GitHub Actions) | GitHub provides this automatically |
 | `ghcr-climatecentral-ai` | Render registry credential | One-time: Render Dashboard |
+
+The workflow **resolves the Render service ID** from the API using the service `name` in your repo’s `render.yaml`. No `RENDER_SERVICE_ID` secret is needed. If a service with that name exists, the workflow finds it and triggers a deploy. If it does not exist, the workflow **creates the service** via the Render API (using plan/region from `render.yaml`, image from the current build, and the `ghcr-climatecentral-ai` registry credential) and then triggers the first deploy.
 
 ## Health Check Endpoint
 
