@@ -1,6 +1,6 @@
-# render-deploy-boilerplate
+# eb-deploy-boilerplate
 
-Production-grade deployment boilerplate for [Render](https://render.com). CI builds and pushes Docker images to GitHub Container Registry (ghcr.io), then Render pulls the prebuilt image -- no double builds, no Render GitHub App needed.
+Deployment boilerplate for AWS Elastic Beanstalk using Docker Compose. CI builds and tests a Docker image once, pushes to ECR, creates an Elastic Beanstalk application version, and updates or creates the target environment idempotently.
 
 ## What's Included
 
@@ -8,10 +8,11 @@ Production-grade deployment boilerplate for [Render](https://render.com). CI bui
 |------|---------|
 | `templates/Dockerfile.python` | Multi-stage Python image (gunicorn, non-root user, health check) |
 | `templates/Dockerfile.node` | Multi-stage Node.js image (npm ci, non-root user, health check) |
-| `templates/render.yaml.tmpl` | Render Blueprint for image-backed service |
-| `templates/.github/workflows/render-deploy.yml` | CI + deploy: build, test, push to ghcr.io, trigger Render |
+| `templates/docker-compose.yml.tmpl` | Compose template with service-name-based defaults and ECR image fallback |
+| `templates/.elasticbeanstalk/config.yml.tmpl` | Elastic Beanstalk CLI metadata (app/env/region defaults) |
+| `templates/.github/workflows/elastic-beanstalk-deploy.yml` | CI + deploy: build, test, push to ECR, create app version, create/update EB environment |
 | `templates/.dockerignore` | Standard ignore patterns for Docker builds |
-| `templates/.env.example` | Template environment variables |
+| `templates/.env.example.*` | Stack-specific environment variable examples |
 | `scaffold.sh` | Copies and customizes templates into a target project |
 
 ## How It Works
@@ -22,32 +23,45 @@ Push to main
     v
 GitHub Actions
     |-- checkout code
-    |-- build Docker image (linux/amd64)
-    |-- run tests against the image
-    |-- push image to ghcr.io/<org>/<repo>:<sha>
-    |-- trigger Render deploy with image ref
+    |-- build Docker image
+    |-- run tests against the built image
+    |-- push image to ECR
+    |-- create EB source bundle (docker-compose + IMAGE_URI)
+    |-- create EB application version
+    |-- create app/env if missing, else update existing env
     |
     v
-Render
-    |-- pull prebuilt image from ghcr.io
-    |-- start container
-    |-- health check /health
-    |-- route traffic
+Elastic Beanstalk
+    |-- pulls prebuilt ECR image
+    |-- starts container(s) from docker-compose.yml
+    |-- health checks /health
+    |-- serves traffic
 ```
 
-The image is built exactly **once** in GitHub Actions. Render never clones your repo or builds anything -- it only pulls and runs the prebuilt image. This means:
+## Naming and Idempotency
 
-- No Render GitHub App installation needed (even for private repos)
-- CI tests run against the exact image that gets deployed
-- Build only happens once
-- Full control over the build pipeline in GitHub Actions
+The deploy workflow derives the canonical name from the first service key in `docker-compose.yml`.
+
+- Default app name: `<service-name>`
+- Default environment name: `<service-name>-env`
+
+For every deploy:
+
+1. Resolve EB application by name and create it if missing.
+2. Resolve EB environment (scoped to the app) and create it if missing.
+3. Create a new application version and apply it to the resolved environment.
+
+Optional overrides are supported through repository variables:
+
+- `EB_APP_NAME`
+- `EB_ENV_NAME`
 
 ## Quick Start
 
 ### Option A: Via agentic-dev.sh (recommended)
 
 ```bash
-# Create a new project with full deploy infrastructure
+# Create a new project with deploy infrastructure
 agentic-dev.sh repo create my-app --description "My app" --with-deploy --stack python
 
 # Or scaffold into an existing repo
@@ -63,54 +77,42 @@ git clone git@github.com:dndodson/render-deploy-boilerplate.git /tmp/boilerplate
 /tmp/boilerplate/scaffold.sh \
   --target /path/to/your/project \
   --name your-service-name \
-  --gh-repo climatecentral-ai/your-repo \
+  --ecr-repo 123456789012.dkr.ecr.us-east-1.amazonaws.com/your-repo \
+  --region us-east-1 \
   --stack python
 ```
 
-## One-Time Setup
+## One-Time AWS Setup
 
-### 1. Render API Key
+### 1. Create ECR Repository
 
-1. Go to [Render Dashboard](https://dashboard.render.com/) > Account Settings > API Keys
-2. Create a key and add to `$OPENCLAW/.env`:
-   ```
-   RENDER_API_KEY=rnd_xxxxx
-   ```
+Create (or let workflow create) an ECR repository matching your scaffolded `--ecr-repo` path.
 
-### 2. GitHub Organization Secret
+### 2. Create S3 Bucket for EB Artifacts
 
-Set `RENDER_API_KEY` as an org secret on `climatecentral-ai`:
+Elastic Beanstalk application versions are uploaded to S3 before deployment.
 
-```bash
-gh secret set RENDER_API_KEY --org climatecentral-ai --visibility all --body "$RENDER_API_KEY"
-```
+### 3. Configure GitHub OIDC Role
 
-### 3. GHCR Registry Credential in Render
+Create an IAM role trusted by GitHub OIDC and grant least-privilege permissions for:
 
-Render needs credentials to pull private images from ghcr.io:
+- ECR push/pull
+- S3 upload/read for the artifact bucket
+- Elastic Beanstalk app/env/version operations
 
-1. Create a GitHub Personal Access Token with `read:packages` scope at [github.com/settings/tokens/new](https://github.com/settings/tokens/new?description=render-ghcr&scopes=read:packages)
-2. In Render Dashboard > Workspace Settings > Container Registry Credentials, click "Add credential":
-   - **Name**: `ghcr-climatecentral-ai`
-   - **Registry**: GitHub Container Registry
-   - **Username**: your GitHub username
-   - **Personal Access Token**: the token from step 1
+### 4. Set GitHub Repository Variables
 
-This credential is reused across all services.
-
-## Secrets Architecture
-
-| Secret | Scope | Set by |
-|--------|-------|--------|
-| `RENDER_API_KEY` | GitHub org secret (`climatecentral-ai`) | One-time: `gh secret set --org` |
-| `GITHUB_TOKEN` | Automatic (GitHub Actions) | GitHub provides this automatically |
-| `ghcr-climatecentral-ai` | Render registry credential | One-time: Render Dashboard |
-
-The workflow **resolves the Render service ID** from the API using the service `name` in your repo’s `render.yaml`. No `RENDER_SERVICE_ID` secret is needed. If a service with that name exists, the workflow finds it and triggers a deploy. If it does not exist, the workflow **creates the service** via the Render API (using plan/region from `render.yaml`, image from the current build, and the `ghcr-climatecentral-ai` registry credential) and then triggers the first deploy.
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `AWS_REGION` | yes | AWS region for ECR and Elastic Beanstalk |
+| `AWS_ROLE_ARN` | yes | IAM role ARN assumed via GitHub OIDC |
+| `EB_ARTIFACTS_BUCKET` | yes | S3 bucket for EB application bundles |
+| `EB_APP_NAME` | no | Override default app name derived from compose service |
+| `EB_ENV_NAME` | no | Override default env name derived from compose service |
 
 ## Health Check Endpoint
 
-Both Dockerfile templates include a health check that hits `/health`. Your application must expose this endpoint:
+Both Dockerfile templates include a health check to `/health`. Your app must return HTTP 200 on that endpoint.
 
 **Python (Flask example)**:
 ```python
@@ -130,17 +132,18 @@ app.get('/health', (req, res) => {
 
 ### Dockerfile
 
-- **Python**: Change `gunicorn` to `uvicorn` for async apps, adjust worker count
-- **Node**: Change `src/index.js` entry point, add TypeScript build steps
-- **Both**: Add system deps in builder stage, adjust health check path
+- **Python**: change `gunicorn` command, worker count, or switch to `uvicorn`.
+- **Node**: change entrypoint (`src/index.js`) or add build steps.
+- **Both**: adjust system dependencies and health check path.
 
-### render.yaml
+### docker-compose.yml
 
-Change plan, region, add env vars, databases, workers. See [Render Blueprint docs](https://render.com/docs/blueprint-spec).
+- Set additional environment variables.
+- Add extra services (the first service key controls default EB naming).
+- Keep the `image: ${IMAGE_URI:-...}` pattern so CI can inject immutable image tags.
 
 ### CI Workflow
 
-- Add more test steps in the `build` job
-- Set `TEST_CMD` env var to customize what runs in the test step
-- Add notifications (Slack, email) to the `deploy` job
-- Add environment-specific deploys (staging vs production)
+- Customize tests with `TEST_CMD`.
+- Add notifications after deploy.
+- Add branch-specific logic for staging/production patterns.

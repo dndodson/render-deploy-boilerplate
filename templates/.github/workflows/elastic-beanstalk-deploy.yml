@@ -1,0 +1,275 @@
+name: CI and Deploy to Elastic Beanstalk
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EB_ARTIFACTS_BUCKET: ${{ vars.EB_ARTIFACTS_BUCKET }}
+  EB_APP_NAME: ${{ vars.EB_APP_NAME }}
+  EB_ENV_NAME: ${{ vars.EB_ENV_NAME }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_uri: ${{ steps.vars.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve first service and image template from docker-compose.yml
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f docker-compose.yml ]; then
+            echo "::error::docker-compose.yml not found in repo root."
+            exit 1
+          fi
+
+          SERVICE_NAME=$(awk '
+            /^services:[[:space:]]*$/ { in_services=1; next }
+            in_services && /^[^[:space:]]/ { in_services=0 }
+            in_services && match($0, /^[[:space:]]+([A-Za-z0-9_.-]+):[[:space:]]*$/, a) { print a[1]; exit }
+          ' docker-compose.yml)
+
+          if [ -z "${SERVICE_NAME:-}" ]; then
+            echo "::error::Could not determine first service name from docker-compose.yml."
+            exit 1
+          fi
+
+          IMAGE_EXPR=$(awk -v svc="$SERVICE_NAME" '
+            /^services:[[:space:]]*$/ { in_services=1; next }
+            in_services && /^[^[:space:]]/ { in_services=0 }
+            in_services && match($0, /^[[:space:]]+([A-Za-z0-9_.-]+):[[:space:]]*$/, a) {
+              cur=a[1]
+              in_target=(cur==svc)
+              next
+            }
+            in_target && match($0, /^[[:space:]]+image:[[:space:]]*(.+)$/, b) {
+              val=b[1]
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+              gsub(/^["'"'"']|["'"'"']$/, "", val)
+              print val
+              exit
+            }
+          ' docker-compose.yml)
+
+          if [ -z "${IMAGE_EXPR:-}" ]; then
+            echo "::error::Could not read image for service '$SERVICE_NAME' from docker-compose.yml."
+            exit 1
+          fi
+
+          DEFAULT_IMAGE=$(echo "$IMAGE_EXPR" | sed -E 's/^\$\{IMAGE_URI:-([^}]+)\}$/\1/')
+          if [ "$DEFAULT_IMAGE" = "$IMAGE_EXPR" ]; then
+            echo "::error::Expected image format \${IMAGE_URI:-<default>}. Got: $IMAGE_EXPR"
+            exit 1
+          fi
+
+          IMAGE_REPO="${DEFAULT_IMAGE%:*}"
+          IMAGE_REPO_NAME="${IMAGE_REPO#*/}"
+          IMAGE_TAG="${GITHUB_SHA}"
+          IMAGE_URI="${IMAGE_REPO}:${IMAGE_TAG}"
+
+          echo "service_name=$SERVICE_NAME" >> "$GITHUB_OUTPUT"
+          echo "image_repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
+          echo "image_repo_name=$IMAGE_REPO_NAME" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (push only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate required deploy variables (push only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_REGION:-}" ] || { echo "::error::AWS_REGION repository variable is required."; exit 1; }
+          [ -n "${{ vars.AWS_ROLE_ARN }}" ] || { echo "::error::AWS_ROLE_ARN repository variable is required."; exit 1; }
+
+      - name: Ensure ECR repository exists (push only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "${{ steps.vars.outputs.image_repo_name }}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "${{ steps.vars.outputs.image_repo_name }}" >/dev/null
+
+      - name: Log in to ECR (push only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            docker build -t "${{ steps.vars.outputs.image_uri }}" .
+          else
+            docker build -t "local-pr-image:${GITHUB_SHA}" .
+          fi
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TEST_IMAGE="${{ steps.vars.outputs.image_uri }}"
+          else
+            TEST_IMAGE="local-pr-image:${GITHUB_SHA}"
+          fi
+          docker run --rm "$TEST_IMAGE" sh -c "${TEST_CMD:-echo 'No TEST_CMD configured, skipping tests'}"
+
+      - name: Push image (push only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: docker push "${{ steps.vars.outputs.image_uri }}"
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate required deploy variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${AWS_REGION:-}" ] || { echo "::error::AWS_REGION repository variable is required."; exit 1; }
+          [ -n "${{ vars.AWS_ROLE_ARN }}" ] || { echo "::error::AWS_ROLE_ARN repository variable is required."; exit 1; }
+          [ -n "${EB_ARTIFACTS_BUCKET:-}" ] || { echo "::error::EB_ARTIFACTS_BUCKET repository variable is required."; exit 1; }
+
+      - name: Resolve service-derived EB names
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE_NAME=$(awk '
+            /^services:[[:space:]]*$/ { in_services=1; next }
+            in_services && /^[^[:space:]]/ { in_services=0 }
+            in_services && match($0, /^[[:space:]]+([A-Za-z0-9_.-]+):[[:space:]]*$/, a) { print a[1]; exit }
+          ' docker-compose.yml)
+          if [ -z "${SERVICE_NAME:-}" ]; then
+            echo "::error::Could not determine first service name from docker-compose.yml."
+            exit 1
+          fi
+
+          APP_NAME="${EB_APP_NAME:-$SERVICE_NAME}"
+          ENV_NAME="${EB_ENV_NAME:-${SERVICE_NAME}-env}"
+
+          echo "service_name=$SERVICE_NAME" >> "$GITHUB_OUTPUT"
+          echo "app_name=$APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "env_name=$ENV_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure Elastic Beanstalk application exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_NAME="${{ steps.names.outputs.app_name }}"
+          EXISTING_APP=$(aws elasticbeanstalk describe-applications \
+            --application-names "$APP_NAME" \
+            --query 'Applications[0].ApplicationName' \
+            --output text || true)
+
+          if [ "$EXISTING_APP" = "None" ] || [ -z "$EXISTING_APP" ]; then
+            aws elasticbeanstalk create-application --application-name "$APP_NAME" >/dev/null
+          fi
+
+      - name: Create source bundle and application version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_NAME="${{ steps.names.outputs.app_name }}"
+          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
+          VERSION_LABEL="gha-${GITHUB_SHA::12}-${GITHUB_RUN_NUMBER}"
+          BUNDLE_DIR="$(mktemp -d)"
+          BUNDLE_ZIP="$BUNDLE_DIR/deploy.zip"
+
+          cp docker-compose.yml "$BUNDLE_DIR/docker-compose.yml"
+          echo "IMAGE_URI=${IMAGE_URI}" > "$BUNDLE_DIR/.env"
+
+          if [ -d .platform ]; then
+            cp -R .platform "$BUNDLE_DIR/.platform"
+          fi
+          if [ -d .ebextensions ]; then
+            cp -R .ebextensions "$BUNDLE_DIR/.ebextensions"
+          fi
+
+          (cd "$BUNDLE_DIR" && zip -rq "$BUNDLE_ZIP" .)
+
+          S3_KEY="${APP_NAME}/${VERSION_LABEL}.zip"
+          aws s3 cp "$BUNDLE_ZIP" "s3://${EB_ARTIFACTS_BUCKET}/${S3_KEY}" >/dev/null
+
+          aws elasticbeanstalk create-application-version \
+            --application-name "$APP_NAME" \
+            --version-label "$VERSION_LABEL" \
+            --source-bundle S3Bucket="${EB_ARTIFACTS_BUCKET}",S3Key="${S3_KEY}" \
+            --process >/dev/null
+
+          echo "version_label=$VERSION_LABEL" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure environment exists or update existing
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_NAME="${{ steps.names.outputs.app_name }}"
+          ENV_NAME="${{ steps.names.outputs.env_name }}"
+          VERSION_LABEL="${{ steps.version.outputs.version_label }}"
+
+          EXISTING_ENV=$(aws elasticbeanstalk describe-environments \
+            --application-name "$APP_NAME" \
+            --environment-names "$ENV_NAME" \
+            --include-deleted false \
+            --query 'Environments[0].EnvironmentName' \
+            --output text || true)
+
+          if [ "$EXISTING_ENV" = "None" ] || [ -z "$EXISTING_ENV" ]; then
+            SOLUTION_STACK=$(aws elasticbeanstalk list-available-solution-stacks \
+              --query "SolutionStacks[?contains(@, 'running Docker')][-1]" \
+              --output text)
+
+            if [ -z "$SOLUTION_STACK" ] || [ "$SOLUTION_STACK" = "None" ]; then
+              echo "::error::Could not resolve a Docker solution stack for Elastic Beanstalk."
+              exit 1
+            fi
+
+            aws elasticbeanstalk create-environment \
+              --application-name "$APP_NAME" \
+              --environment-name "$ENV_NAME" \
+              --version-label "$VERSION_LABEL" \
+              --solution-stack-name "$SOLUTION_STACK" >/dev/null
+          else
+            aws elasticbeanstalk update-environment \
+              --application-name "$APP_NAME" \
+              --environment-name "$ENV_NAME" \
+              --version-label "$VERSION_LABEL" >/dev/null
+          fi
+
+      - name: Wait for environment ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws elasticbeanstalk wait environment-updated \
+            --application-name "${{ steps.names.outputs.app_name }}" \
+            --environment-names "${{ steps.names.outputs.env_name }}"

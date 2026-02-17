@@ -4,9 +4,9 @@ set -euo pipefail
 # scaffold.sh — Copy and customize deploy templates into a target project.
 #
 # Usage:
-#   scaffold.sh --target /path/to/project --name my-app --gh-repo org/repo --stack python [--force]
-#   scaffold.sh --target /path/to/project --name my-app --gh-repo org/repo --stack node [--force]
-#   scaffold.sh --target /path/to/project --name my-app --gh-repo org/repo  # auto-detects stack
+#   scaffold.sh --target /path/to/project --name my-app --ecr-repo 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app --stack python [--force]
+#   scaffold.sh --target /path/to/project --name my-app --ecr-repo 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app --stack node [--force]
+#   scaffold.sh --target /path/to/project --name my-app --ecr-repo 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app  # auto-detects stack
 #
 # Templates are resolved relative to this script's location.
 
@@ -40,7 +40,12 @@ render_template() {
   sed \
     -e "s|__SERVICE_NAME__|${SERVICE_NAME}|g" \
     -e "s|__PORT__|${PORT}|g" \
-    -e "s|__GH_REPO__|${GH_REPO}|g" \
+    -e "s|__ECR_REPO__|${ECR_REPO}|g" \
+    -e "s|__RUNTIME_ENV_KEY__|${RUNTIME_ENV_KEY}|g" \
+    -e "s|__RUNTIME_ENV_VALUE__|${RUNTIME_ENV_VALUE}|g" \
+    -e "s|__EB_APP_NAME__|${EB_APP_NAME}|g" \
+    -e "s|__EB_ENV_NAME__|${EB_ENV_NAME}|g" \
+    -e "s|__AWS_REGION__|${AWS_REGION}|g" \
     "$src" > "$dest"
   info "created: $dest"
   CREATED_FILES+=("$dest")
@@ -59,12 +64,15 @@ detect_stack() {
 
 usage() {
   cat <<'EOF'
-Usage: scaffold.sh --target <dir> --name <name> --gh-repo <owner/repo> [--stack python|node] [--force]
+Usage: scaffold.sh --target <dir> --name <name> --ecr-repo <account.dkr.ecr.region.amazonaws.com/repo> [--region us-east-1] [--eb-app name] [--eb-env name] [--stack python|node] [--force]
 
 Options:
   --target    Target project directory (required)
-  --name      Service name for render.yaml (required)
-  --gh-repo   GitHub owner/repo for ghcr.io image URL (required)
+  --name      Primary service name (used in docker-compose.yml) (required)
+  --ecr-repo  Full ECR repo URI (required)
+  --region    AWS region for Elastic Beanstalk defaults (default: us-east-1)
+  --eb-app    Optional EB application name (default: --name)
+  --eb-env    Optional EB environment name (default: <name>-env)
   --stack     python or node (auto-detected if omitted)
   --force     Overwrite existing files
 EOF
@@ -75,15 +83,21 @@ EOF
 
 TARGET=""
 SERVICE_NAME=""
-GH_REPO=""
+ECR_REPO=""
 STACK=""
 FORCE="false"
+AWS_REGION="us-east-1"
+EB_APP_NAME=""
+EB_ENV_NAME=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target)  TARGET="$2"; shift 2 ;;
     --name)    SERVICE_NAME="$2"; shift 2 ;;
-    --gh-repo) GH_REPO="$2"; shift 2 ;;
+    --ecr-repo) ECR_REPO="$2"; shift 2 ;;
+    --region) AWS_REGION="$2"; shift 2 ;;
+    --eb-app) EB_APP_NAME="$2"; shift 2 ;;
+    --eb-env) EB_ENV_NAME="$2"; shift 2 ;;
     --stack)   STACK="$2"; shift 2 ;;
     --force)   FORCE="true"; shift ;;
     -h|--help) usage ;;
@@ -94,7 +108,7 @@ done
 [[ -n "$TARGET" ]]       || die "--target is required"
 [[ -d "$TARGET" ]]       || die "Target directory does not exist: $TARGET"
 [[ -n "$SERVICE_NAME" ]] || die "--name is required"
-[[ -n "$GH_REPO" ]]     || die "--gh-repo is required (e.g. climatecentral-ai/my-app)"
+[[ -n "$ECR_REPO" ]]    || die "--ecr-repo is required (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app)"
 
 if [[ -z "$STACK" ]]; then
   STACK=$(detect_stack "$TARGET")
@@ -102,10 +116,25 @@ if [[ -z "$STACK" ]]; then
 fi
 
 case "$STACK" in
-  python) PORT="8000" ;;
-  node)   PORT="3000" ;;
+  python)
+    PORT="8000"
+    RUNTIME_ENV_KEY="FLASK_ENV"
+    RUNTIME_ENV_VALUE="production"
+    ;;
+  node)
+    PORT="3000"
+    RUNTIME_ENV_KEY="NODE_ENV"
+    RUNTIME_ENV_VALUE="production"
+    ;;
   *) die "Unknown stack: $STACK (must be python or node)" ;;
 esac
+
+if [[ -z "$EB_APP_NAME" ]]; then
+  EB_APP_NAME="$SERVICE_NAME"
+fi
+if [[ -z "$EB_ENV_NAME" ]]; then
+  EB_ENV_NAME="${SERVICE_NAME}-env"
+fi
 
 # ─── Scaffold files ─────────────────────────────────────────────────────────
 
@@ -114,11 +143,14 @@ CREATED_FILES=()
 # Dockerfile
 copy_if_missing "$TEMPLATES_DIR/Dockerfile.${STACK}" "$TARGET/Dockerfile"
 
-# render.yaml (stack-specific template)
-render_template "$TEMPLATES_DIR/render.yaml.${STACK}.tmpl" "$TARGET/render.yaml"
+# docker-compose.yml
+render_template "$TEMPLATES_DIR/docker-compose.yml.tmpl" "$TARGET/docker-compose.yml"
+
+# .elasticbeanstalk/config.yml
+render_template "$TEMPLATES_DIR/.elasticbeanstalk/config.yml.tmpl" "$TARGET/.elasticbeanstalk/config.yml"
 
 # GitHub Actions workflow
-copy_if_missing "$TEMPLATES_DIR/.github/workflows/render-deploy.yml" "$TARGET/.github/workflows/render-deploy.yml"
+copy_if_missing "$TEMPLATES_DIR/.github/workflows/elastic-beanstalk-deploy.yml" "$TARGET/.github/workflows/elastic-beanstalk-deploy.yml"
 
 # .dockerignore
 copy_if_missing "$TEMPLATES_DIR/.dockerignore" "$TARGET/.dockerignore"

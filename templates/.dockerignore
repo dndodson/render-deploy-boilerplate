@@ -24,4 +24,3 @@ Makefile
 docker-compose*.yml
 .dockerignore
 Dockerfile*
-render.yaml

@@ -1,0 +1,9 @@
+services:
+  __SERVICE_NAME__:
+    image: "${IMAGE_URI:-__ECR_REPO__:latest}"
+    restart: always
+    ports:
+      - "__PORT__:__PORT__"
+    environment:
+      PORT: "__PORT__"
+      __RUNTIME_ENV_KEY__: "__RUNTIME_ENV_VALUE__"
