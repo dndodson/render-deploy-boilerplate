@@ -114,8 +114,8 @@ CREATED_FILES=()
 # Dockerfile
 copy_if_missing "$TEMPLATES_DIR/Dockerfile.${STACK}" "$TARGET/Dockerfile"
 
-# render.yaml (templated)
-render_template "$TEMPLATES_DIR/render.yaml.tmpl" "$TARGET/render.yaml"
+# render.yaml (stack-specific template)
+render_template "$TEMPLATES_DIR/render.yaml.${STACK}.tmpl" "$TARGET/render.yaml"
 
 # GitHub Actions workflow
 copy_if_missing "$TEMPLATES_DIR/.github/workflows/render-deploy.yml" "$TARGET/.github/workflows/render-deploy.yml"
@@ -123,8 +123,8 @@ copy_if_missing "$TEMPLATES_DIR/.github/workflows/render-deploy.yml" "$TARGET/.g
 # .dockerignore
 copy_if_missing "$TEMPLATES_DIR/.dockerignore" "$TARGET/.dockerignore"
 
-# .env.example
-copy_if_missing "$TEMPLATES_DIR/.env.example" "$TARGET/.env.example"
+# .env.example (stack-specific)
+copy_if_missing "$TEMPLATES_DIR/.env.example.${STACK}" "$TARGET/.env.example"
 
 # ─── Output ──────────────────────────────────────────────────────────────────
 

@@ -27,4 +27,11 @@ EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT}/health')" || exit 1
 
+# ── Entrypoint ───────────────────────────────────────────────────────────────
+# ADAPT THIS to match your app's entry point:
+#   Flask factory pattern:  gunicorn "app:create_app()" ...
+#   Flask module-level app: gunicorn app:app ...
+#   FastAPI:                uvicorn app:app --host 0.0.0.0 --port ${PORT}
+#
+# Your app MUST expose GET /health returning 200 for the health check above.
 CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 4 --timeout 120 app:app"]

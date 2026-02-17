@@ -34,4 +34,10 @@ EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "const http = require('http'); const req = http.get('http://localhost:' + process.env.PORT + '/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) }); req.on('error', () => process.exit(1))" || exit 1
 
+# ── Entrypoint ───────────────────────────────────────────────────────────────
+# ADAPT THIS to match your app's entry point:
+#   Express/vanilla: node src/index.js
+#   With npm script:  npm start
+#
+# Your app MUST expose GET /health returning 200 for the health check above.
 CMD ["node", "src/index.js"]
